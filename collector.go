@@ -1,7 +1,8 @@
 package main
 
 import (
-	"io/ioutil"
+	"fmt"
+	"net"
 	"os"
 	"runtime"
 	"strconv"
@@ -15,238 +16,511 @@ import (
 )
 
 const (
-	NetnsPath         = "/run/netns/"
-	InterfaceStatPath = "/sys/devices/virtual/net/"
-	ProcStatPath      = "/proc/"
+	NetnsPath          = "/run/netns/"
+	InterfaceStatPath  = "/sys/class/net/" // standard symlink path
+	ProcThreadStatPath = "/proc/thread-self/"
+	ProcStatPath       = "/proc/"
 
 	collectorNamespace = "netns"
 	collectorSubsystem = "network"
-	netnsLabel         = "netns"
-	deviceLabel        = "device"
+
+	// Label names
+	netnsLabel  = "netns"
+	deviceLabel = "device"
+	hostLabel   = "host"
+	ipLabel     = "deviceIP"
+	typeLabel   = "type"
+
+	// Conntrack Metrics
+	metricConntrackTotal = "conntrack_total"
+	metricConntrackMax   = "conntrack_max"
+	conntrackTotalPath   = "sys/net/netfilter/nf_conntrack_count"
+	conntrackMaxPath     = "sys/net/netfilter/nf_conntrack_max"
+
+	// SNMP Metrics
+	metricTcpRetransSegs = "tcp_retrans_segs_total"
+	metricTcpInErrs      = "tcp_in_errs_total"
+	metricUdpInErrors    = "udp_in_errors_total"
+	metricUdpNoPorts     = "udp_no_ports_total"
+
+	// Sockstat Metrics
+	metricSocketsUsed = "sockets_used"
+	metricTcpInUse    = "tcp_sockets_inuse"
+	metricTcpTimeWait = "tcp_sockets_tw"
+	metricTcpMem      = "tcp_sockets_mem"
+	metricUdpInUse    = "udp_sockets_inuse"
 )
 
 type Collector struct {
-	logger      logrus.FieldLogger
-	config      *NetnsExporterConfig
-	intfMetrics map[string]*prometheus.Desc
-	procMetrics map[string]*PrometheusProcMetric
-}
-
-type PrometheusProcMetric struct {
-	Config ProcMetric
-	Desc   *prometheus.Desc
+	logger          logrus.FieldLogger
+	config          *NetnsExporterConfig
+	nsMetrics       *prometheus.Desc
+	intfMetrics     map[string]*prometheus.Desc
+	dhcpMetrics     map[string]*prometheus.Desc
+	qrouterMetrics  map[string]*prometheus.Desc
+	ctMetrics       map[string]*prometheus.Desc
+	snmpMetrics     map[string]*prometheus.Desc
+	sockstatMetrics map[string]*prometheus.Desc
+	hostname        string
 }
 
 func NewCollector(config *NetnsExporterConfig, logger *logrus.Logger) *Collector {
+	// Pre-compute hostname once to save syscalls
+	hostname, _ := os.Hostname()
+
+	nsMetrics := prometheus.NewDesc(
+		prometheus.BuildFQName(collectorNamespace, collectorSubsystem, "namespaces_total"),
+		"Total number of network namespaces found",
+		[]string{hostLabel}, nil,
+	)
 	// Add descriptions for interface metrics
 	intfMetrics := make(map[string]*prometheus.Desc, len(config.InterfaceMetrics))
 	for _, metric := range config.InterfaceMetrics {
 		intfMetrics[metric] = prometheus.NewDesc(
 			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metric+"_total"),
 			"Interface statistics in the network namespace",
-			[]string{netnsLabel, deviceLabel},
+			[]string{netnsLabel, deviceLabel, typeLabel, hostLabel, ipLabel},
 			nil,
 		)
 	}
-	// Add descriptions for proc metrics
-	procMetrics := make(map[string]*PrometheusProcMetric, len(config.InterfaceMetrics))
-	for metricName, metric := range config.ProcMetrics {
-		procMetrics[metricName] = &PrometheusProcMetric{
-			Config: metric,
-			Desc: prometheus.NewDesc(
-				prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricName+"_total"),
-				"Statistics from /proc filesystem in the network namespace",
-				[]string{netnsLabel},
-				nil,
-			),
-		}
+
+	// Add descriptions for ct metrics
+	ctMetrics := map[string]*prometheus.Desc{
+		"Conntrack_Total": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricConntrackTotal),
+			"Number of NAT connection tracking entries in the network namespace",
+			[]string{netnsLabel, typeLabel, hostLabel},
+			nil,
+		),
+		"Conntrack_Max": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricConntrackMax),
+			"Maximum number of NAT connection tracking entries in the network namespace",
+			[]string{netnsLabel, typeLabel, hostLabel},
+			nil,
+		),
+	}
+
+	// Initialize SNMP Descriptors
+	snmpMetrics := map[string]*prometheus.Desc{
+		"Tcp_RetransSegs": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricTcpRetransSegs),
+			"Total TCP segments retransmitted",
+			[]string{netnsLabel, typeLabel, hostLabel}, nil,
+		),
+		"Tcp_InErrs": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricTcpInErrs),
+			"Total TCP segments received in error",
+			[]string{netnsLabel, typeLabel, hostLabel}, nil,
+		),
+		"Udp_InErrors": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricUdpInErrors),
+			"Total UDP packets received with errors",
+			[]string{netnsLabel, typeLabel, hostLabel}, nil,
+		),
+		"Udp_NoPorts": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricUdpNoPorts),
+			"Total UDP packets received on closed ports",
+			[]string{netnsLabel, typeLabel, hostLabel}, nil,
+		),
+	}
+
+	// Initialize Sockstat Descriptors
+	sockstatMetrics := map[string]*prometheus.Desc{
+		"sockets_used": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricSocketsUsed),
+			"Total used sockets",
+			[]string{netnsLabel, typeLabel, hostLabel}, nil,
+		),
+		"TCP_inuse": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricTcpInUse),
+			"TCP sockets currently in use",
+			[]string{netnsLabel, typeLabel, hostLabel}, nil,
+		),
+		"TCP_tw": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricTcpTimeWait),
+			"TCP sockets in TimeWait state",
+			[]string{netnsLabel, typeLabel, hostLabel}, nil,
+		),
+		"TCP_mem": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricTcpMem),
+			"Kernel memory used by TCP buffers (in pages)",
+			[]string{netnsLabel, typeLabel, hostLabel}, nil,
+		),
+		"UDP_inuse": prometheus.NewDesc(
+			prometheus.BuildFQName(collectorNamespace, collectorSubsystem, metricUdpInUse),
+			"UDP sockets currently in use",
+			[]string{netnsLabel, typeLabel, hostLabel}, nil,
+		),
 	}
 
 	return &Collector{
-		logger:      logger.WithField("component", "collector"),
-		config:      config,
-		intfMetrics: intfMetrics,
-		procMetrics: procMetrics,
+		logger:          logger.WithField("component", "collector"),
+		config:          config,
+		nsMetrics:       nsMetrics,
+		intfMetrics:     intfMetrics,
+		ctMetrics:       ctMetrics,
+		snmpMetrics:     snmpMetrics,
+		sockstatMetrics: sockstatMetrics,
+		hostname:        hostname,
 	}
 }
 
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.nsMetrics
 	for _, desc := range c.intfMetrics {
 		ch <- desc
 	}
-
-	for _, metric := range c.procMetrics {
-		ch <- metric.Desc
+	for _, desc := range c.ctMetrics {
+		ch <- desc
+	}
+	for _, desc := range c.snmpMetrics {
+		ch <- desc
+	}
+	for _, desc := range c.sockstatMetrics {
+		ch <- desc
 	}
 }
 
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
-	// Limit the number of concurrent goroutines, because each will block an entire
-	// operating system thread. Maximum number of gorutines == number of CPU cores.
-	wg := NewLimitedWaitGroup(c.config.Threads)
 	startTime := time.Now()
-	// Get namespases files
-	nsFiles, err := ioutil.ReadDir(NetnsPath)
-	if err != nil {
-		c.logger.Errorf("Reading list of network nemaspaces failed: %s", err)
 
+	// 1. Get Namespace Files
+	nsFiles, err := os.ReadDir(NetnsPath)
+	if err != nil {
+		c.logger.Errorf("Failed to read namespace dir %s: %v", NetnsPath, err)
 		return
 	}
 
-	// Filter namespaces by regexp if namespace-filters declared in config
-	if (c.config.NamespacesFilter.BlacklistPattern != "") ||
-		(c.config.NamespacesFilter.WhitelistPattern != "") {
-		nsFiles = c.filterNsFiles(nsFiles)
-	}
+	ch <- prometheus.MustNewConstMetric(
+		c.nsMetrics,
+		prometheus.GaugeValue,
+		float64(len(nsFiles)),
+		c.hostname,
+	)
 
-	c.logger.Debugf("Found %d namespaces", len(nsFiles))
-	c.logger.Debugf("Only %d parallel goroutines will be run", runtime.NumCPU())
+	// 2. Setup Concurrency Control
+	// We use the LimitedWaitGroup we defined earlier.
+	wg := NewLimitedWaitGroup(c.config.Threads)
 
-	// Get metrics from all of namespaces
-	for _, ns := range nsFiles {
+	c.logger.Debugf("Found %d namespaces. Using %d threads.", len(nsFiles), c.config.Threads)
+
+	for _, nsFile := range nsFiles {
+		name := nsFile.Name()
+
+		// 3. Filter Namespace
+		if !c.config.NamespacesFilter.IsAllowed(name) {
+			c.logger.Debugf("Skipping namespace %s (filtered)", name)
+			continue
+		}
+
+		// 4. Start Worker
 		wg.Add(1)
-
-		go c.getMetricsFromNamespace(ns.Name(), wg, ch)
+		go func(nsName string) {
+			defer wg.Done()
+			c.collectNamespace(nsName, ch)
+		}(name)
 	}
 
 	wg.Wait()
-	c.logger.Debugf("collecting took %s for %d namespaces", time.Since(startTime), len(nsFiles))
+	c.logger.Debugf("Collection cycle took %s", time.Since(startTime))
 }
 
-func (c *Collector) getMetricsFromNamespace(namespace string, wg *LimitedWaitGroup, ch chan<- prometheus.Metric) {
-	defer wg.Done()
-
-	c.logger.Debugf("Start getting statistics for namespace %s", namespace)
-	// Lock the OS Thread so we don't accidentally switch namespaces
+// collectNamespace runs in a separate goroutine.
+// It locks the OS thread, switches namespace, collects metrics, and cleans up.
+func (c *Collector) collectNamespace(namespace string, ch chan<- prometheus.Metric) {
+	// 1. Lock OS Thread (CRITICAL)
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	startTime := time.Now()
-	// Save current namespace
-	curNs, err := netns.Get()
+	// 2. Save Host Namespace (to restore later)
+	originalNS, err := netns.Get()
 	if err != nil {
-		c.logger.Errorf("Get current namespace %s failed: %s", namespace, err)
-
+		c.logger.Errorf("Failed to get current namespace: %v", err)
 		return
 	}
-	defer curNs.Close()
-	defer netns.Set(curNs) //nolint:errcheck
+	defer originalNS.Close()
 
-	// Switch namespace
-	ns, err := netns.GetFromName(namespace)
+	// Safety: Always restore host namespace before unlocking the thread
+	defer func() {
+		_ = netns.Set(originalNS)
+	}()
+
+	// 3. Open Target Namespace
+	targetNS, err := netns.GetFromName(namespace)
 	if err != nil {
-		c.logger.Errorf("Get net namespace by name %s failed: %s", namespace, err)
+		c.logger.Warnf("Failed to get namespace handle for %s: %v", namespace, err)
+		return
+	}
+	defer targetNS.Close()
 
+	// 4. Switch to Target Namespace
+	if err := netns.Set(targetNS); err != nil {
+		c.logger.Errorf("Failed to switch to namespace %s: %v", namespace, err)
 		return
 	}
 
-	if err := netns.Set(ns); err != nil {
-		c.logger.Errorf("Change net namespace to %s failed: %s", namespace, err)
-
-		return
-	}
-	defer ns.Close()
-
-	// Say to the kernel that we will use separate  context
-	if err := syscall.Unshare(syscall.CLONE_NEWNS); err != nil { //nolint:typecheck
-		c.logger.Errorf("Syscall unshare failed in namespace %s: %s", namespace, err)
-
+	// 5. Create Private Mount Namespace (Sandbox)
+	// We need this ONLY for /sys. /proc is handled by thread-self.
+	if err := syscall.Unshare(syscall.CLONE_NEWNS); err != nil {
+		c.logger.Errorf("Unshare failed for %s: %v", namespace, err)
 		return
 	}
 
-	// Don't let any mounts propagate back to the parent
-	// See: https://github.com/shemminger/iproute2/blob/6754e1d9783458550dce8d309efb4091ec8089a5/lib/namespace.c#L77
-	// and: https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt
-	if err := syscall.Mount("", "/", "none", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil { //nolint:typecheck
-		c.logger.Errorf("Mount root with rslave option failed in namepsace %s: %s", namespace, err)
-
+	// Prevent mount propagation back to the host
+	if err := syscall.Mount("", "/", "none", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
+		c.logger.Errorf("Failed to remount root as slave in %s: %v", namespace, err)
 		return
 	}
 
-	// Mount sysfs from net nemaspace
-	if err := syscall.Mount(namespace, "/sys", "sysfs", 0, "ro"); err != nil { //nolint:typecheck
-		c.logger.Errorf("Mount /sys from the namespace failed in namespace: %s", namespace, err)
+	// 6. Mount /sys
+	// We MUST still mount /sys because /sys/class/net is not thread-aware.
+	// A. Unmount old /sys (best effort)
+	_ = syscall.Unmount("/sys", syscall.MNT_DETACH)
 
+	// B. Mount new /sys specific to this namespace
+	if err := syscall.Mount("sysfs", "/sys", "sysfs", syscall.MS_RDONLY, ""); err != nil {
+		c.logger.Warnf("Failed to mount sysfs for %s: %v", namespace, err)
 		return
 	}
-	defer syscall.Unmount("/sys", syscall.MNT_DETACH) //nolint:errcheck,typecheck
+	defer syscall.Unmount("/sys", syscall.MNT_DETACH)
 
-	// Parse interfaces statistics
-	ifFiles, err := ioutil.ReadDir(InterfaceStatPath)
+	// 7. Collect Metrics
+	// Interfaces use /sys (mounted above)
+	c.collectInterfaces(namespace, ch)
+
+	// These now use /proc/thread-self/..., so they automatically see the new NS
+	c.collectCtMetrics(namespace, ch)
+	c.collectSnmpMetrics(namespace, ch)
+	c.collectSockstatMetrics(namespace, ch)
+}
+
+func (c *Collector) collectInterfaces(namespace string, ch chan<- prometheus.Metric) {
+	ifFiles, err := os.ReadDir(InterfaceStatPath)
 	if err != nil {
-		c.logger.Errorf("Reading sysfs directory for interface %s in namespace %s failed: %s", InterfaceStatPath, namespace, err)
-
+		c.logger.Errorf("Failed to read %s in namespace %s: %v", InterfaceStatPath, namespace, err)
 		return
 	}
 
 	for _, ifFile := range ifFiles {
-		// We don't need to get stat for lo interface
-		if ifFile.Name() == "lo" {
+		devName := ifFile.Name()
+
+		// Skip loopback and filtered devices
+		if devName == "lo" || !c.config.DeviceFilter.IsAllowed(devName) {
 			continue
 		}
 
-		c.logger.Debugf("Start getting statistics for interface %s in namespace %s", ifFile.Name(), namespace)
+		// Get IP (Note: We are already IN the namespace, so we just use net package)
+		deviceIP, err := c.getIPv4Address(devName)
+		if err != nil {
+			c.logger.Debugf("Could not get IP for %s in %s: %v", devName, namespace, err)
+		}
 
+		// Read metrics
 		for metricName, desc := range c.intfMetrics {
-			value := c.getMetricFromFile(namespace, InterfaceStatPath+ifFile.Name()+"/statistics/"+metricName)
-			ch <- prometheus.MustNewConstMetric(desc, prometheus.CounterValue, value, namespace, ifFile.Name())
+			val := c.readFloatFromFile(InterfaceStatPath + devName + "/statistics/" + metricName)
+			if val == -1 {
+				continue
+			}
+
+			ch <- prometheus.MustNewConstMetric(
+				desc,
+				prometheus.CounterValue,
+				val,
+				namespace,
+				devName,
+				getType(namespace),
+				c.hostname,
+				deviceIP,
+			)
 		}
 	}
-
-	// Parse of /proc statistics
-	for _, metric := range c.procMetrics {
-		value := c.getMetricFromFile(namespace, ProcStatPath+metric.Config.FileName)
-		ch <- prometheus.MustNewConstMetric(metric.Desc, prometheus.CounterValue, value, namespace)
-	}
-
-	c.logger.Debugf("processing namespace %s took %s", namespace, time.Since(startTime))
 }
 
-func (c *Collector) getMetricFromFile(namespace, file string) float64 {
-	data, err := ioutil.ReadFile(file)
-	if err != nil {
-		c.logger.Errorf("Error while reading statistic file %s in namespace %s: %s", file, namespace, err)
+func (c *Collector) collectCtMetrics(namespace string, ch chan<- prometheus.Metric) {
+	metricPaths := map[string]string{
+		"Conntrack_Total": conntrackTotalPath,
+		"Conntrack_Max":   conntrackMaxPath,
+	}
+	for metricName, metricPath := range metricPaths {
+		desc := c.ctMetrics[metricName]
+		val := c.readFloatFromFile(ProcStatPath + metricPath)
+		if val == -1 {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(
+			desc,
+			prometheus.GaugeValue,
+			val,
+			namespace,
+			getType(namespace),
+			c.hostname,
+		)
+	}
+}
 
+// readFloatFromFile reads a single float from a file. Returns -1 on error.
+func (c *Collector) readFloatFromFile(path string) float64 {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		c.logger.Debugf("Failed to read file %s: %v", path, err)
 		return -1
 	}
 
-	stat, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64)
+	val, err := strconv.ParseFloat(strings.TrimSpace(string(data)), 64)
 	if err != nil {
-		c.logger.Printf("Error while parsing data from file %s in namespace %s: %s", file, namespace, err)
-
+		c.logger.Warnf("Failed to parse float from %s: %v", path, err)
 		return -1
 	}
-
-	return stat
+	return val
 }
 
-func (c *Collector) filterNsFiles(nsFiles []os.FileInfo) []os.FileInfo {
-	blacklistRegexp := c.config.NamespacesFilter.BlacklistRegexp
-	whitelistRegexp := c.config.NamespacesFilter.WhitelistRegexp
-
-	if blacklistRegexp.String() != "" {
-		tmp := make([]os.FileInfo, 0)
-
-		for _, ns := range nsFiles {
-			if !blacklistRegexp.MatchString(ns.Name()) {
-				tmp = append(tmp, ns)
-			}
-		}
-
-		nsFiles = tmp
+// collectSnmpMetrics collects SNMP-related metrics from /proc/net/snmp
+func (c *Collector) collectSnmpMetrics(namespace string, ch chan<- prometheus.Metric) {
+	snmpFile := ProcThreadStatPath + "net/snmp"
+	data, err := os.ReadFile(snmpFile)
+	if err != nil {
+		c.logger.Errorf("Failed to read SNMP file %s in namespace %s: %v", snmpFile, namespace, err)
+		return
 	}
 
-	if whitelistRegexp.String() != "" {
-		tmp := make([]os.FileInfo, 0)
+	lines := strings.Split(string(data), "\n")
+	snmpData := make(map[string]map[string]float64)
 
-		for _, ns := range nsFiles {
-			if whitelistRegexp.MatchString(ns.Name()) {
-				tmp = append(tmp, ns)
-			}
+	// Parse SNMP file into a map
+	for i := 0; i < len(lines)-1; i += 2 {
+		header := strings.Fields(lines[i])
+		values := strings.Fields(lines[i+1])
+		if len(header) != len(values) {
+			continue
 		}
-
-		nsFiles = tmp
+		proto := strings.TrimSuffix(header[0], ":")
+		snmpData[proto] = make(map[string]float64)
+		for j := 1; j < len(header); j++ {
+			val, err := strconv.ParseFloat(values[j], 64)
+			if err != nil {
+				continue
+			}
+			snmpData[proto][header[j]] = val
+		}
 	}
 
-	return nsFiles
+	// Map metrics to descriptors and emit
+	metricMap := map[string]struct {
+		proto string
+		field string
+		desc  *prometheus.Desc
+	}{
+		"Tcp_RetransSegs": {"Tcp", "RetransSegs", c.snmpMetrics["Tcp_RetransSegs"]},
+		"Tcp_InErrs":      {"Tcp", "InErrs", c.snmpMetrics["Tcp_InErrs"]},
+		"Udp_InErrors":    {"Udp", "InErrors", c.snmpMetrics["Udp_InErrors"]},
+		"Udp_NoPorts":     {"Udp", "NoPorts", c.snmpMetrics["Udp_NoPorts"]},
+	}
+
+	for _, info := range metricMap {
+		if val, ok := snmpData[info.proto][info.field]; ok {
+			ch <- prometheus.MustNewConstMetric(
+				info.desc,
+				prometheus.CounterValue,
+				val,
+				namespace,
+				getType(namespace),
+				c.hostname,
+			)
+		}
+	}
+}
+
+// collectSockstatMetrics collects socket statistics from /proc/net/sockstat
+func (c *Collector) collectSockstatMetrics(namespace string, ch chan<- prometheus.Metric) {
+	sockstatFile := ProcThreadStatPath + "net/sockstat"
+	data, err := os.ReadFile(sockstatFile)
+	if err != nil {
+		c.logger.Errorf("Failed to read sockstat file %s in namespace %s: %v", sockstatFile, namespace, err)
+		return
+	}
+
+	lines := strings.Split(string(data), "\n")
+	sockstatData := make(map[string]map[string]float64)
+
+	// Parse sockstat file into a map
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		proto := strings.TrimSuffix(fields[0], ":")
+		sockstatData[proto] = make(map[string]float64)
+		for i := 1; i < len(fields)-1; i += 2 {
+			val, err := strconv.ParseFloat(fields[i+1], 64)
+			if err != nil {
+				continue
+			}
+			sockstatData[proto][fields[i]] = val
+		}
+	}
+
+	// Map metrics to descriptors and emit
+	metricMap := map[string]struct {
+		proto string
+		field string
+		desc  *prometheus.Desc
+	}{
+		"sockets_used": {"sockets", "used", c.sockstatMetrics["sockets_used"]},
+		"TCP_inuse":    {"TCP", "inuse", c.sockstatMetrics["TCP_inuse"]},
+		"TCP_tw":       {"TCP", "tw", c.sockstatMetrics["TCP_tw"]},
+		"TCP_mem":      {"TCP", "mem", c.sockstatMetrics["TCP_mem"]},
+		"UDP_inuse":    {"UDP", "inuse", c.sockstatMetrics["UDP_inuse"]},
+	}
+
+	for _, info := range metricMap {
+		if val, ok := sockstatData[info.proto][info.field]; ok {
+			ch <- prometheus.MustNewConstMetric(
+				info.desc,
+				prometheus.GaugeValue,
+				val,
+				namespace,
+				getType(namespace),
+				c.hostname,
+			)
+		}
+	}
+}
+
+// getIPv4Address retrieves the first IPv4 address of the interface.
+// Assumes the current thread is already in the correct namespace.
+func (c *Collector) getIPv4Address(device string) (string, error) {
+	iface, err := net.InterfaceByName(device)
+	if err != nil {
+		return "", err
+	}
+
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return "", err
+	}
+
+	for _, addr := range addrs {
+		// ParseCIDR handles both "192.168.1.1/24" and "::1/128"
+		ip, _, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			continue
+		}
+
+		// Check if it's strictly IPv4 (To4 returns non-nil)
+		if ipv4 := ip.To4(); ipv4 != nil {
+			return ipv4.String(), nil
+		}
+	}
+
+	return "", fmt.Errorf("no ipv4 address found")
+}
+
+// getType returns the type label based on namespace name
+func getType(namespace string) string {
+	if strings.HasPrefix(namespace, "qrouter-") {
+		return "qrouter"
+	} else if strings.HasPrefix(namespace, "dhcp-") {
+		return "dhcp"
+	}
+	return "other"
 }

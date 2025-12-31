@@ -4,48 +4,41 @@ import (
 	"sync"
 )
 
+// LimitedWaitGroup limits the number of concurrent goroutines.
 type LimitedWaitGroup struct {
-	wg              sync.WaitGroup
-	mu              *sync.Mutex
-	cond            *sync.Cond
-	limit, copasity int
+	wg  sync.WaitGroup
+	sem chan struct{}
 }
 
+// NewLimitedWaitGroup creates a wait group that only allows 'limit' active slots.
 func NewLimitedWaitGroup(limit int) *LimitedWaitGroup {
-	mu := new(sync.Mutex)
-
+	if limit <= 0 {
+		panic("LimitedWaitGroup: limit must be positive")
+	}
 	return &LimitedWaitGroup{
-		mu:       mu,
-		cond:     sync.NewCond(mu),
-		limit:    limit,
-		copasity: limit,
+		sem: make(chan struct{}, limit),
 	}
 }
 
+// Add acquires slots. It blocks if the limit is reached.
 func (lg *LimitedWaitGroup) Add(delta int) {
-	lg.mu.Lock()
-	defer lg.mu.Unlock()
-
-	if delta > lg.limit {
-		panic(`LimitedWaitGroup: delta must not exceed limit`)
+	if delta <= 0 {
+		return // Or handle as an error; standard sync.WaitGroup allows negative delta, but usually for Done.
 	}
 
-	for lg.copasity < 1 {
-		lg.cond.Wait()
+	for i := 0; i < delta; i++ {
+		lg.sem <- struct{}{} // Acquire slot (blocks if full)
 	}
-
-	lg.copasity -= delta
 	lg.wg.Add(delta)
 }
 
+// Done releases a slot and notifies the WaitGroup.
 func (lg *LimitedWaitGroup) Done() {
-	lg.mu.Lock()
-	defer lg.mu.Unlock()
-	lg.copasity++
-	lg.cond.Signal()
+	<-lg.sem // Release slot
 	lg.wg.Done()
 }
 
+// Wait blocks until all goroutines have finished.
 func (lg *LimitedWaitGroup) Wait() {
 	lg.wg.Wait()
 }
