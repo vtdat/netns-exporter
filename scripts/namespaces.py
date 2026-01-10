@@ -4,14 +4,14 @@ import os
 
 IDS = (
     [0,100],
-    [101,200],
-    [201,300],
-    [301,400],
-    [401,500],
-    [501,600],
-    [601,700],
-    [701,800],
-    [801, 900],
+    #[101,200],
+    #[201,300],
+    #[301,400],
+    #[401,500],
+    #[501,600],
+    #[601,700],
+    #[701,800],
+    #[801, 900],
     # [901,1000],
     # [1001,1100],
     # [1101,1200],
@@ -23,15 +23,15 @@ def create_test_namespaces(numbers):
     exec_command('modprobe ip_conntrack')
     print('Creating namespaces: %s' % numbers)
     for ns_num in range(*numbers):
-        os.system('ip netns add test-router-%d' % ns_num)
+        os.system('ip netns add qrouter-%d' % ns_num)
         for intf_num in range(NUMBER_OF_INTERFACES):
             exec_command('ip link add test-eth-%d%d type dummy'
                          % (ns_num, intf_num))
-            exec_command('ip link set test-eth-%d%d netns test-router-%d'
+            exec_command('ip link set test-eth-%d%d netns qrouter-%d'
                          % (ns_num, intf_num, ns_num))
-            exec_command('ip netns exec test-router-%d ifconfig '
+            exec_command('ip netns exec qrouter-%d ifconfig '
                          'test-eth-%d%d up' % (ns_num, ns_num, intf_num))
-        print('namespace: test-router-%d created' % ns_num)
+        print('namespace: qrouter-%d created' % ns_num)
 
 
 def delete_test_namespaces(numbers):

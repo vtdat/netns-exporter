@@ -32,6 +32,9 @@ type APIServer struct {
 	server   *http.Server
 	logger   logrus.FieldLogger
 	registry *prometheus.Registry // Use a specific registry instead of global
+	cache    *MetricCache
+	ctx      context.Context
+	cancel   context.CancelFunc
 }
 
 func NewAPIServer(config *NetnsExporterConfig, logger *logrus.Logger) (*APIServer, error) {
@@ -44,19 +47,32 @@ func NewAPIServer(config *NetnsExporterConfig, logger *logrus.Logger) (*APIServe
 	registry.MustRegister(prometheus.NewGoCollector())
 	registry.MustRegister(version.NewCollector(exporterName))
 
+	// 2. Create metric cache
+	cache := NewMetricCache(config.ScrapeInterval, logger)
+
+	// 3. Create context for cache lifecycle management
+	ctx, cancel := context.WithCancel(context.Background())
+
 	apiServer := &APIServer{
 		config:   config,
 		logger:   logger.WithField("component", "api-server"),
 		registry: registry,
+		cache:    cache,
+		ctx:      ctx,
+		cancel:   cancel,
 	}
 
-	// 2. Register your custom collector
-	collector := NewCollector(config, logger)
+	// 4. Register your custom collector
+	collector := NewCollector(config, logger, cache)
 	if err := registry.Register(collector); err != nil {
+		cancel()
 		return nil, fmt.Errorf("registering collector failed: %w", err)
 	}
 
-	// 3. Configure HTTP Server
+	// 5. Start periodic cache updates in background
+	cache.StartPeriodicUpdate(ctx, collector)
+
+	// 6. Configure HTTP Server
 	httpMux := http.NewServeMux()
 
 	// Use net.JoinHostPort for robust address formatting (handles IPv6)
@@ -72,7 +88,7 @@ func NewAPIServer(config *NetnsExporterConfig, logger *logrus.Logger) (*APIServe
 		IdleTimeout:       timeout,
 	}
 
-	// 4. Setup Routes
+	// 7. Setup Routes
 	// Use the dedicated registry for the handler
 	promHandler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
 		ErrorLog:      logger,
@@ -94,9 +110,13 @@ func (s *APIServer) Start() error {
 	return nil
 }
 
-// Shutdown gracefully stops the server.
+// Shutdown gracefully stops the server and cache updates.
 func (s *APIServer) Shutdown(ctx context.Context) error {
 	s.logger.Info("Shutting down API server...")
+
+	// Stop periodic cache updates
+	s.cancel()
+
 	return s.server.Shutdown(ctx)
 }
 

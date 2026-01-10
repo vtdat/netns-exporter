@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"runtime"
@@ -15,6 +16,20 @@ type NetnsExporterConfig struct {
 	Threads          int             `yaml:"threads"`
 	NamespacesFilter RegexFilter     `yaml:"namespaces_filter"`
 	DeviceFilter     RegexFilter     `yaml:"device_filter"`
+	InternalCIDRs    []string        `yaml:"internal_cidrs"`
+	DestinationHost  string          `yaml:"destination_host"`
+	ScrapeInterval   int             `yaml:"scrape_interval"`
+	LogDirectory     string          `yaml:"log_directory"`
+	EnabledMetrics   MetricsConfig   `yaml:"enabled_metrics"`
+}
+
+type MetricsConfig struct {
+	Interface bool `yaml:"interface"`
+	Conntrack bool `yaml:"conntrack"`
+	SNMP      bool `yaml:"snmp"`
+	Sockstat  bool `yaml:"sockstat"`
+	Ping      bool `yaml:"ping"`
+	ARP       bool `yaml:"arp"`
 }
 
 type APIServerConfig struct {
@@ -47,13 +62,53 @@ func LoadConfig(path string) (*NetnsExporterConfig, error) {
 		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
+	// Validate Config
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("config validation error: %w", err)
+	}
+
 	// Apply Defaults
 	// Only override threads if not specified in config
 	if cfg.Threads <= 0 {
 		cfg.Threads = runtime.NumCPU()
 	}
 
+	// Set default log directory if not specified
+	if cfg.LogDirectory == "" {
+		cfg.LogDirectory = "/var/log/netns-exporter"
+	}
+
+	// Default scrape interval to 60 seconds if not specified
+	if cfg.ScrapeInterval <= 0 {
+		cfg.ScrapeInterval = 60
+	}
+
+	// Apply metric defaults - enable all by default if not specified
+	cfg.applyMetricDefaults()
+
 	return &cfg, nil
+}
+
+// applyMetricDefaults sets default values for metric collection flags
+// All metrics are enabled by default if not explicitly configured
+func (cfg *NetnsExporterConfig) applyMetricDefaults() {
+	// If no metrics are explicitly configured, enable all by default
+	// This maintains backward compatibility
+	allDisabled := !cfg.EnabledMetrics.Interface &&
+		!cfg.EnabledMetrics.Conntrack &&
+		!cfg.EnabledMetrics.SNMP &&
+		!cfg.EnabledMetrics.Sockstat &&
+		!cfg.EnabledMetrics.Ping &&
+		!cfg.EnabledMetrics.ARP
+
+	if allDisabled {
+		cfg.EnabledMetrics.Interface = true
+		cfg.EnabledMetrics.Conntrack = true
+		cfg.EnabledMetrics.SNMP = true
+		cfg.EnabledMetrics.Sockstat = true
+		cfg.EnabledMetrics.Ping = true
+		cfg.EnabledMetrics.ARP = true
+	}
 }
 
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
@@ -105,4 +160,25 @@ func (rf *RegexFilter) IsAllowed(name string) bool {
 
 	// Default Allow
 	return true
+}
+
+// isValidCIDR checks if InternalCIDRs are valid CIDR notation
+func isValidCIDR(cidr string) bool {
+	_, _, err := net.ParseCIDR(cidr)
+	return err == nil
+}
+func (cfg *NetnsExporterConfig) Validate() error {
+	// Validate InternalCIDRs
+	for _, cidr := range cfg.InternalCIDRs {
+		if !isValidCIDR(cidr) {
+			return fmt.Errorf("invalid CIDR notation in internal_cidrs: %s", cidr)
+		}
+	}
+
+	// Validate that destination_host is set if ping monitoring is enabled
+	if cfg.EnabledMetrics.Ping && cfg.DestinationHost == "" {
+		return fmt.Errorf("destination_host must be configured when ping monitoring is enabled")
+	}
+
+	return nil
 }

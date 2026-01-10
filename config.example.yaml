@@ -1,6 +1,6 @@
 api_server:
-  server_address: 127.0.0.1
-  server_port: 8080
+  server_address: 0.0.0.0
+  server_port: 9101
   request_timeout: 600
   telemetry_path: /metrics
 
@@ -19,9 +19,15 @@ interface_metrics:
 
 # (Optional) Filter namespaces by regular expression
 # With the simultaneous use of two filters, the blacklist has a higher priority
-# namespaces_filter:
+namespaces_filter:
 #   blacklist_pattern: "regexp_pattern1"
-#   whitelist_pattern: "regexp_pattern2"
+#   whitelist_pattern: "^qrouter-\\d$"
 # device_filter:
 #   blacklist_pattern: regexp_pattern1
 #   whitelist_pattern: regexp_pattern2
+internal_cidrs:
+  - "10.0.0.0/9"
+
+destination_host: 1.1.1.1
+scrape_interval: 60
+log_directory: /var/log/netns-exporter
