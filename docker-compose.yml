@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  netns-exporter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: netns-exporter:latest
+    container_name: netns-exporter
+    privileged: true
+    network_mode: host
+    volumes:
+      # Network namespace directories (read-only)
+      - /run/netns:/run/netns:ro
+      - /sys:/sys:ro
+      # Configuration file (read-only)
+      - ./config.docker.yaml:/etc/netns-exporter/config.yaml:ro
+      # Log directory for ping logs (read-write)
+      - /var/log/netns-exporter:/var/log/netns-exporter
+    
+    # Set PID namespace to host to access all processes
+    pid: host
+    # Environment variables (optional)
+    environment:
+      - LOG_LEVEL=info
+    # Restart policy
+    restart: unless-stopped
+    # Health check to verify exporter is running
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9101/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Resource limits (optional, adjust as needed)
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
