@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -34,6 +35,11 @@ const (
 	hostLabel   = "host"
 	ipLabel     = "deviceIP"
 	typeLabel   = "type"
+
+	// ARP state flags (from /proc/net/arp)
+	arpIncomplete = "0x0"
+	arpReachable  = "0x2"
+	arpStale      = "0x6"
 
 	// Conntrack Metrics
 	metricConntrackTotal = "conntrack_total"
@@ -354,6 +360,9 @@ func (c *Collector) collectMetrics() []CachedMetricData {
 func (c *Collector) collectNamespace(namespace string) []CachedMetricData {
 	metricData := make([]CachedMetricData, 0)
 
+	// Cache namespace type to avoid redundant string comparisons
+	nsType := getType(namespace)
+
 	// 1. Lock OS Thread (CRITICAL)
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -408,29 +417,29 @@ func (c *Collector) collectNamespace(namespace string) []CachedMetricData {
 
 	// 7. Collect Metrics
 	if c.config.EnabledMetrics.Interface {
-		metricData = append(metricData, c.collectInterfaces(namespace)...)
+		metricData = append(metricData, c.collectInterfaces(namespace, nsType)...)
 	}
 
 	if c.config.EnabledMetrics.Conntrack {
-		metricData = append(metricData, c.collectCtMetrics(namespace)...)
+		metricData = append(metricData, c.collectCtMetrics(namespace, nsType)...)
 	}
 
 	if c.config.EnabledMetrics.SNMP {
-		metricData = append(metricData, c.collectSnmpMetrics(namespace)...)
+		metricData = append(metricData, c.collectSnmpMetrics(namespace, nsType)...)
 	}
 
 	if c.config.EnabledMetrics.Sockstat {
-		metricData = append(metricData, c.collectSockstatMetrics(namespace)...)
+		metricData = append(metricData, c.collectSockstatMetrics(namespace, nsType)...)
 	}
 
-	if c.config.EnabledMetrics.ARP && getType(namespace) == "qrouter" {
-		metricData = append(metricData, c.collectArpMetrics(namespace)...)
+	if c.config.EnabledMetrics.ARP && nsType == "qrouter" {
+		metricData = append(metricData, c.collectArpMetrics(namespace, nsType)...)
 	}
 
 	return metricData
 }
 
-func (c *Collector) collectInterfaces(namespace string) []CachedMetricData {
+func (c *Collector) collectInterfaces(namespace string, nsType string) []CachedMetricData {
 	metricData := make([]CachedMetricData, 0)
 
 	ifFiles, err := os.ReadDir(InterfaceStatPath)
@@ -458,13 +467,14 @@ func (c *Collector) collectInterfaces(namespace string) []CachedMetricData {
 		}
 
 		// Check if IP is external and collect ping metrics
-		if c.config.EnabledMetrics.Ping && deviceIP != "" && !c.isIPInInternalCIDRs(deviceIP) && getType(namespace) == "qrouter" {
-			metricData = append(metricData, c.collectPingMetrics(namespace, deviceIP)...)
+		if c.config.EnabledMetrics.Ping && deviceIP != "" && !c.isIPInInternalCIDRs(deviceIP) && nsType == "qrouter" {
+			metricData = append(metricData, c.collectPingMetrics(namespace, deviceIP, nsType)...)
 		}
 
 		// Read metrics
 		for metricName := range c.intfMetrics {
-			val := c.readFloatFromFile(InterfaceStatPath + devName + "/statistics/" + metricName)
+			statPath := filepath.Join(InterfaceStatPath, devName, "statistics", metricName)
+			val := c.readFloatFromFile(statPath)
 			if val == -1 {
 				continue
 			}
@@ -472,7 +482,7 @@ func (c *Collector) collectInterfaces(namespace string) []CachedMetricData {
 			metricData = append(metricData, CachedMetricData{
 				Desc:        metricName,
 				Value:       val,
-				LabelValues: []string{namespace, devName, getType(namespace), c.hostname, deviceIP},
+				LabelValues: []string{namespace, devName, nsType, c.hostname, deviceIP},
 			})
 		}
 	}
@@ -481,7 +491,7 @@ func (c *Collector) collectInterfaces(namespace string) []CachedMetricData {
 }
 
 // collectPingMetrics handles ping monitoring for external IP addresses
-func (c *Collector) collectPingMetrics(namespace string, deviceIP string) []CachedMetricData {
+func (c *Collector) collectPingMetrics(namespace string, deviceIP string, nsType string) []CachedMetricData {
 	metricData := make([]CachedMetricData, 0)
 
 	// Ensure log directory exists
@@ -508,18 +518,21 @@ func (c *Collector) collectPingMetrics(namespace string, deviceIP string) []Cach
 		return metricData
 	}
 
+	// Build label values once for reuse
+	pingLabels := []string{namespace, deviceIP, nsType, c.hostname, c.config.DestinationHost}
+
 	// Add success rate metric
 	metricData = append(metricData, CachedMetricData{
 		Desc:        "Ping_SuccessRate",
 		Value:       successRate,
-		LabelValues: []string{namespace, deviceIP, getType(namespace), c.hostname, c.config.DestinationHost},
+		LabelValues: pingLabels,
 	})
 
 	// Add average latency metric
 	metricData = append(metricData, CachedMetricData{
 		Desc:        "Ping_AverageLatency",
 		Value:       avgLatency,
-		LabelValues: []string{namespace, deviceIP, getType(namespace), c.hostname, c.config.DestinationHost},
+		LabelValues: pingLabels,
 	})
 
 	// Spawn new ping process asynchronously
@@ -529,7 +542,7 @@ func (c *Collector) collectPingMetrics(namespace string, deviceIP string) []Cach
 }
 
 // collectCtMetrics collects conntrack metrics
-func (c *Collector) collectCtMetrics(namespace string) []CachedMetricData {
+func (c *Collector) collectCtMetrics(namespace string, nsType string) []CachedMetricData {
 	metricData := make([]CachedMetricData, 0)
 
 	metricPaths := map[string]string{
@@ -538,7 +551,7 @@ func (c *Collector) collectCtMetrics(namespace string) []CachedMetricData {
 	}
 
 	for metricName, metricPath := range metricPaths {
-		val := c.readFloatFromFile(ProcStatPath + metricPath)
+		val := c.readFloatFromFile(filepath.Join(ProcStatPath, metricPath))
 		if val == -1 {
 			continue
 		}
@@ -546,7 +559,7 @@ func (c *Collector) collectCtMetrics(namespace string) []CachedMetricData {
 		metricData = append(metricData, CachedMetricData{
 			Desc:        metricName,
 			Value:       val,
-			LabelValues: []string{namespace, getType(namespace), c.hostname},
+			LabelValues: []string{namespace, nsType, c.hostname},
 		})
 	}
 
@@ -570,10 +583,10 @@ func (c *Collector) readFloatFromFile(path string) float64 {
 }
 
 // collectSnmpMetrics collects SNMP-related metrics from /proc/net/snmp
-func (c *Collector) collectSnmpMetrics(namespace string) []CachedMetricData {
+func (c *Collector) collectSnmpMetrics(namespace string, nsType string) []CachedMetricData {
 	metricData := make([]CachedMetricData, 0)
 
-	snmpFile := ProcThreadStatPath + "net/snmp"
+	snmpFile := filepath.Join(ProcThreadStatPath, "net/snmp")
 	data, err := os.ReadFile(snmpFile)
 	if err != nil {
 		c.logger.Errorf("Failed to read SNMP file %s in namespace %s: %v", snmpFile, namespace, err)
@@ -617,7 +630,7 @@ func (c *Collector) collectSnmpMetrics(namespace string) []CachedMetricData {
 			metricData = append(metricData, CachedMetricData{
 				Desc:        metricName,
 				Value:       val,
-				LabelValues: []string{namespace, getType(namespace), c.hostname},
+				LabelValues: []string{namespace, nsType, c.hostname},
 			})
 		}
 	}
@@ -626,10 +639,10 @@ func (c *Collector) collectSnmpMetrics(namespace string) []CachedMetricData {
 }
 
 // collectSockstatMetrics collects socket statistics from /proc/net/sockstat
-func (c *Collector) collectSockstatMetrics(namespace string) []CachedMetricData {
+func (c *Collector) collectSockstatMetrics(namespace string, nsType string) []CachedMetricData {
 	metricData := make([]CachedMetricData, 0)
 
-	sockstatFile := ProcThreadStatPath + "net/sockstat"
+	sockstatFile := filepath.Join(ProcThreadStatPath, "net/sockstat")
 	data, err := os.ReadFile(sockstatFile)
 	if err != nil {
 		c.logger.Errorf("Failed to read sockstat file %s in namespace %s: %v", sockstatFile, namespace, err)
@@ -673,7 +686,7 @@ func (c *Collector) collectSockstatMetrics(namespace string) []CachedMetricData 
 			metricData = append(metricData, CachedMetricData{
 				Desc:        metricName,
 				Value:       val,
-				LabelValues: []string{namespace, getType(namespace), c.hostname},
+				LabelValues: []string{namespace, nsType, c.hostname},
 			})
 		}
 	}
@@ -682,10 +695,10 @@ func (c *Collector) collectSockstatMetrics(namespace string) []CachedMetricData 
 }
 
 // collectArpMetrics collects ARP table entries from /proc/net/arp for qrouter namespaces
-func (c *Collector) collectArpMetrics(namespace string) []CachedMetricData {
+func (c *Collector) collectArpMetrics(namespace string, nsType string) []CachedMetricData {
 	metricData := make([]CachedMetricData, 0)
 
-	arpFile := ProcThreadStatPath + "net/arp"
+	arpFile := filepath.Join(ProcThreadStatPath, "net/arp")
 	data, err := os.ReadFile(arpFile)
 	if err != nil {
 		c.logger.Debugf("Failed to read ARP file %s in namespace %s: %v", arpFile, namespace, err)
@@ -713,18 +726,18 @@ func (c *Collector) collectArpMetrics(namespace string) []CachedMetricData {
 		flags := fields[2]
 		state := "incomplete"
 		switch flags {
-		case "0x2":
+		case arpReachable:
 			state = "reachable"
-		case "0x6":
+		case arpStale:
 			state = "stale"
-		case "0x0":
+		case arpIncomplete:
 			state = "incomplete"
 		}
 
 		metricData = append(metricData, CachedMetricData{
 			Desc:        "arp_entries",
 			Value:       1,
-			LabelValues: []string{namespace, getType(namespace), c.hostname, ipAddress, hwAddress, device, state},
+			LabelValues: []string{namespace, nsType, c.hostname, ipAddress, hwAddress, device, state},
 		})
 	}
 
@@ -774,12 +787,7 @@ func (c *Collector) isIPInInternalCIDRs(ip string) bool {
 		return false
 	}
 
-	for _, cidr := range c.config.InternalCIDRs {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			c.logger.Debugf("Invalid CIDR in config: %s: %v", cidr, err)
-			continue
-		}
+	for _, ipNet := range c.config.parsedCIDRs {
 		if ipNet.Contains(parsedIP) {
 			return true
 		}
@@ -789,13 +797,35 @@ func (c *Collector) isIPInInternalCIDRs(ip string) bool {
 
 // ensurePingLogDirectory creates the log directory if it doesn't exist
 func (c *Collector) ensurePingLogDirectory(namespace string) error {
-	logDir := c.config.LogDirectory + "/" + namespace
+	logDir := filepath.Join(c.config.LogDirectory, namespace)
 	return os.MkdirAll(logDir, 0755)
 }
 
 // getPingLogPath returns the full path to the ping log file for a namespace
 func (c *Collector) getPingLogPath(namespace string) string {
-	return c.config.LogDirectory + "/" + namespace + "/ping_log"
+	return filepath.Join(c.config.LogDirectory, namespace, "ping_log")
+}
+
+// rotatePingLog truncates the ping log file to keep only the last maxLines lines
+func (c *Collector) rotatePingLog(logPath string, maxLines int) {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) <= maxLines {
+		return
+	}
+
+	// Keep only the last maxLines
+	startIdx := len(lines) - maxLines
+	truncated := strings.Join(lines[startIdx:], "\n")
+
+	// Write back truncated content
+	if err := os.WriteFile(logPath, []byte(truncated+"\n"), 0644); err != nil {
+		c.logger.Debugf("Failed to rotate ping log for namespace %s: %v", logPath, err)
+	}
 }
 
 // appendPingResult appends a ping result to the log file with timestamp
@@ -899,19 +929,29 @@ func (c *Collector) spawnPingProcess(namespace string, destination string) {
 
 		expectedPings := c.config.ScrapeInterval
 		receivedPings := 0
+		var pingMu sync.Mutex
+
+		// Use WaitGroup to ensure both stdout and stderr goroutines complete
+		var ioWg sync.WaitGroup
 
 		scanner := bufio.NewScanner(stdout)
+		ioWg.Add(1)
 		go func() {
+			defer ioWg.Done()
 			for scanner.Scan() {
 				line := scanner.Text()
 				if strings.Contains(line, "time=") {
+					pingMu.Lock()
 					receivedPings++
+					pingMu.Unlock()
 					latency := extractLatencyFromPingOutput(line)
 					if appendErr := c.appendPingResult(logPath, fmt.Sprintf("success %.2f", latency)); appendErr != nil {
 						c.logger.Debugf("Failed to append ping result for namespace %s: %v", namespace, appendErr)
 					}
 				} else if strings.Contains(line, "Destination Host Unreachable") {
+					pingMu.Lock()
 					receivedPings++
+					pingMu.Unlock()
 					if appendErr := c.appendPingResult(logPath, "failure 0"); appendErr != nil {
 						c.logger.Debugf("Failed to append ping result for namespace %s: %v", namespace, appendErr)
 					}
@@ -919,11 +959,21 @@ func (c *Collector) spawnPingProcess(namespace string, destination string) {
 			}
 		}()
 
-		go io.Copy(io.Discard, stderr)
+		ioWg.Add(1)
+		go func() {
+			defer ioWg.Done()
+			_, _ = io.Copy(io.Discard, stderr)
+		}()
 
 		if err := cmd.Wait(); err != nil {
 			c.logger.Debugf("Ping process completed for namespace %s (some pings may have failed)", namespace)
 		}
+
+		// Wait for stdout and stderr goroutines to finish reading
+		ioWg.Wait()
+
+		// Log rotation: truncate file if it's getting too large (keep last 2*scrape_interval lines)
+		c.rotatePingLog(logPath, c.config.ScrapeInterval*2)
 
 		timeoutCount := expectedPings - receivedPings
 		for i := 0; i < timeoutCount; i++ {

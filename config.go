@@ -17,6 +17,7 @@ type NetnsExporterConfig struct {
 	NamespacesFilter RegexFilter     `yaml:"namespaces_filter"`
 	DeviceFilter     RegexFilter     `yaml:"device_filter"`
 	InternalCIDRs    []string        `yaml:"internal_cidrs"`
+	parsedCIDRs      []*net.IPNet    // Pre-parsed CIDRs for efficient lookup
 	DestinationHost  string          `yaml:"destination_host"`
 	ScrapeInterval   int             `yaml:"scrape_interval"`
 	LogDirectory     string          `yaml:"log_directory"`
@@ -65,6 +66,11 @@ func LoadConfig(path string) (*NetnsExporterConfig, error) {
 	// Validate Config
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config validation error: %w", err)
+	}
+
+	// Pre-parse CIDRs for efficient lookup
+	if err := cfg.parseCIDRs(); err != nil {
+		return nil, fmt.Errorf("failed to parse CIDRs: %w", err)
 	}
 
 	// Apply Defaults
@@ -138,6 +144,19 @@ func (rf *RegexFilter) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		}
 	}
 
+	return nil
+}
+
+// parseCIDRs pre-parses InternalCIDRs into []*net.IPNet for efficient lookup
+func (cfg *NetnsExporterConfig) parseCIDRs() error {
+	cfg.parsedCIDRs = make([]*net.IPNet, 0, len(cfg.InternalCIDRs))
+	for _, cidrStr := range cfg.InternalCIDRs {
+		_, ipNet, err := net.ParseCIDR(cidrStr)
+		if err != nil {
+			return fmt.Errorf("invalid CIDR notation '%s': %w", cidrStr, err)
+		}
+		cfg.parsedCIDRs = append(cfg.parsedCIDRs, ipNet)
+	}
 	return nil
 }
 

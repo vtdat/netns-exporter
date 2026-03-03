@@ -26,10 +26,13 @@ func (lg *LimitedWaitGroup) Add(delta int) {
 		return // Or handle as an error; standard sync.WaitGroup allows negative delta, but usually for Done.
 	}
 
+	// CRITICAL: Call wg.Add() BEFORE acquiring slots to prevent race condition
+	// If a goroutine finishes between slot acquisition and wg.Add(), Wait() could return early
+	lg.wg.Add(delta)
+
 	for i := 0; i < delta; i++ {
 		lg.sem <- struct{}{} // Acquire slot (blocks if full)
 	}
-	lg.wg.Add(delta)
 }
 
 // Done releases a slot and notifies the WaitGroup.

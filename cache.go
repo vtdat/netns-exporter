@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -18,13 +19,19 @@ type CachedMetricData struct {
 }
 
 // MetricCache stores cached metric data with timestamp
+// Uses atomic.Value for lock-free reads of immutable data
 type MetricCache struct {
-	mu             sync.RWMutex
-	metricData     []CachedMetricData
-	lastUpdate     time.Time
+	mu             sync.Mutex // Protects writes only
+	data           atomic.Value
 	scrapeInterval time.Duration
 	updateInterval time.Duration
 	logger         logrus.FieldLogger
+}
+
+// cacheData holds the cached data and timestamp
+type cacheData struct {
+	metrics []CachedMetricData
+	ts      time.Time
 }
 
 // NewMetricCache creates a new metric cache
@@ -33,56 +40,55 @@ func NewMetricCache(scrapeIntervalSeconds int, logger *logrus.Logger) *MetricCac
 	scrapeInterval := time.Duration(scrapeIntervalSeconds) * time.Second
 	updateInterval := scrapeInterval / 2
 
-	return &MetricCache{
-		metricData:     make([]CachedMetricData, 0),
+	cache := &MetricCache{
 		scrapeInterval: scrapeInterval,
 		updateInterval: updateInterval,
 		logger:         logger.WithField("component", "cache"),
 	}
+	// Initialize with empty data
+	cache.data.Store(cacheData{
+		metrics: make([]CachedMetricData, 0),
+		ts:      time.Time{},
+	})
+	return cache
 }
 
 // GetMetricData returns cached metric data and the timestamp when they were collected
+// Uses lock-free atomic load for better performance under concurrent access
+// Returns the slice directly without copying - the slice is immutable after storage
 func (mc *MetricCache) GetMetricData() ([]CachedMetricData, time.Time) {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-
-	// Return a copy of the metric data slice to avoid race conditions
-	dataCopy := make([]CachedMetricData, len(mc.metricData))
-	copy(dataCopy, mc.metricData)
-
-	return dataCopy, mc.lastUpdate
+	stored := mc.data.Load().(cacheData)
+	return stored.metrics, stored.ts
 }
 
 // UpdateCache stores new metric data and updates the timestamp
+// Uses atomic Store to publish new data atomically to all readers
 func (mc *MetricCache) UpdateCache(data []CachedMetricData) {
 	mc.mu.Lock()
 	defer mc.mu.Unlock()
 
-	mc.metricData = data
-	mc.lastUpdate = time.Now()
+	mc.data.Store(cacheData{
+		metrics: data,
+		ts:      time.Now(),
+	})
 
 	mc.logger.Debugf("Cache updated with %d metrics at %s",
-		len(data), mc.lastUpdate.Format(time.RFC3339))
+		len(data), time.Now().Format(time.RFC3339))
 }
 
 // GetCacheAge returns how old the cache is
 func (mc *MetricCache) GetCacheAge() time.Duration {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-
-	if mc.lastUpdate.IsZero() {
+	stored := mc.data.Load().(cacheData)
+	if stored.ts.IsZero() {
 		return 0
 	}
-
-	return time.Since(mc.lastUpdate)
+	return time.Since(stored.ts)
 }
 
 // GetLastUpdateTime returns the timestamp of the last cache update
 func (mc *MetricCache) GetLastUpdateTime() time.Time {
-	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-
-	return mc.lastUpdate
+	stored := mc.data.Load().(cacheData)
+	return stored.ts
 }
 
 // StartPeriodicUpdate starts a background goroutine that periodically updates the cache
