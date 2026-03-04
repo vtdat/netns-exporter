@@ -27,6 +27,11 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap returns the underlying ResponseWriter (for Go 1.20+ compatibility)
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 type APIServer struct {
 	config   *NetnsExporterConfig
 	server   *http.Server

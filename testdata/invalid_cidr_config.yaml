@@ -1,0 +1,22 @@
+api_server:
+  server_address: 0.0.0.0
+  server_port: 9101
+  request_timeout: 30
+  telemetry_path: /metrics
+
+interface_metrics:
+  - rx_bytes
+  - tx_bytes
+
+threads: 4
+
+internal_cidrs:
+  - 10.0.0.0/8
+  - invalid-cidr-notation
+
+destination_host: 8.8.8.8
+scrape_interval: 60
+log_directory: /var/log/netns-exporter
+
+enabled_metrics:
+  interface: true

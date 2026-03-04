@@ -1,0 +1,40 @@
+api_server:
+  server_address: 0.0.0.0
+  server_port: 9101
+  request_timeout: 30
+  telemetry_path: /metrics
+
+interface_metrics:
+  - rx_bytes
+  - tx_bytes
+  - rx_packets
+  - tx_packets
+  - rx_errors
+  - tx_errors
+  - rx_dropped
+  - tx_dropped
+
+threads: 4
+
+namespaces_filter:
+  whitelist_pattern: "^qrouter-\\d$"
+  blacklist_pattern: "^test-"
+
+device_filter:
+  blacklist_pattern: "^dummy"
+
+internal_cidrs:
+  - 10.0.0.0/8
+  - 192.168.0.0/16
+
+destination_host: 8.8.8.8
+scrape_interval: 60
+log_directory: /var/log/netns-exporter
+
+enabled_metrics:
+  interface: true
+  conntrack: true
+  snmp: true
+  sockstat: true
+  ping: true
+  arp: true
